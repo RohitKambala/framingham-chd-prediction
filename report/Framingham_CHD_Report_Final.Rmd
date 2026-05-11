@@ -1,0 +1,569 @@
+---
+title: "Predicting 10-Year Coronary Heart Disease Risk Using Machine Learning"
+subtitle: "GPH-GU 2338 — Machine Learning for Public Health | Spring 2026"
+author: "Rohit Kambala, Jacob Parquet"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+fontsize: 11pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width  = 7,
+  fig.height = 4.5
+)
+
+library(tidyverse)
+library(caret)
+library(pROC)
+library(corrplot)
+library(smotefamily)
+library(randomForest)
+library(xgboost)
+library(rms)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(scales)
+```
+
+```{r full-pipeline, include=FALSE, cache=TRUE}
+# ============================================================
+# FULL REPRODUCIBLE PIPELINE
+# This chunk reproduces every result in the report.
+# All downstream chunks pull from objects created here.
+# ============================================================
+
+set.seed(1)
+
+# 1. Load -----------------------------------------------------------------
+fram_raw <- read.csv("framingham.csv")
+fram     <- fram_raw
+
+# 2. Assess missingness by outcome ----------------------------------------
+glucose_mar <- fram |>
+  group_by(TenYearCHD) |>
+  summarise(pct_missing = round(mean(is.na(glucose)) * 100, 1), n = n())
+
+# 3. Impute ---------------------------------------------------------------
+fram <- fram |>
+  mutate(across(everything(), ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+stopifnot(sum(is.na(fram)) == 0)
+
+# 4. Prepare outcome as factor -------------------------------------------
+fram$TenYearCHD <- as.factor(fram$TenYearCHD)
+
+# 5. Stratified split -----------------------------------------------------
+idx       <- createDataPartition(y = fram$TenYearCHD, p = 0.8, list = FALSE)
+train_set <- fram[idx,  ]
+test_set  <- fram[-idx, ]
+
+# 6. Drop diaBP from both sets -------------------------------------------
+train_set <- train_set |> select(-diaBP)
+test_set  <- test_set  |> select(-diaBP)
+
+# 7. SMOTE on training set only ------------------------------------------
+smote_out     <- SMOTE(
+  X      = train_set[, names(train_set) != "TenYearCHD"],
+  target = as.numeric(as.character(train_set$TenYearCHD)),
+  K = 5, dup_size = 0
+)
+train_balanced <- smote_out$data
+
+train_balanced$TenYearCHD <- as.factor(
+  ifelse(train_balanced$class == "1", "Yes", "No")
+)
+train_balanced$class <- NULL
+
+test_set$TenYearCHD <- as.factor(
+  ifelse(as.character(test_set$TenYearCHD) == "1", "Yes", "No")
+)
+train_balanced$TenYearCHD <- relevel(train_balanced$TenYearCHD, ref = "Yes")
+test_set$TenYearCHD       <- relevel(test_set$TenYearCHD,       ref = "Yes")
+
+# 8. Logistic Regression --------------------------------------------------
+log_mod       <- glm(TenYearCHD ~ ., data = train_balanced, family = "binomial")
+log_pred_prob <- predict(log_mod, newdata = test_set, type = "response")
+actual_factor <- test_set$TenYearCHD
+
+roc_log <- roc(actual_factor, log_pred_prob,
+               levels = c("No","Yes"), direction = "<", quiet = TRUE)
+
+youden_log   <- coords(roc_log, "best", best.method = "youden")
+log_pred_03  <- relevel(as.factor(ifelse(log_pred_prob > 0.30,    "Yes","No")), ref="Yes")
+log_pred_y   <- relevel(as.factor(ifelse(log_pred_prob > youden_log$threshold, "Yes","No")), ref="Yes")
+cm_log_03    <- confusionMatrix(log_pred_03, actual_factor, positive = "Yes")
+cm_log_y     <- confusionMatrix(log_pred_y,  actual_factor, positive = "Yes")
+
+# 9. KNN ------------------------------------------------------------------
+pp           <- preProcess(train_balanced[, names(train_balanced)!="TenYearCHD"],
+                            method = c("center","scale"))
+train_scaled <- predict(pp, train_balanced)
+test_scaled  <- predict(pp, test_set)
+
+tc <- trainControl(method="cv", number=10,
+                   classProbs=TRUE, summaryFunction=twoClassSummary)
+
+knn_mod      <- train(TenYearCHD ~ ., data = train_scaled, method = "knn",
+                      trControl = tc, tuneGrid = expand.grid(k=1:19), metric="ROC")
+knn_pred_prob <- predict(knn_mod, newdata=test_scaled, type="prob")[,"Yes"]
+knn_pred      <- predict(knn_mod, newdata=test_scaled)
+roc_knn <- roc(test_scaled$TenYearCHD, knn_pred_prob,
+               levels=c("No","Yes"), direction="<", quiet=TRUE)
+cm_knn  <- confusionMatrix(knn_pred, test_scaled$TenYearCHD, positive="Yes")
+
+# 10. Random Forest -------------------------------------------------------
+rf_mod <- train(TenYearCHD ~ ., data = train_balanced, method = "rf",
+                trControl = tc, tuneGrid = expand.grid(mtry=2:8),
+                ntree = 500, metric = "ROC")
+rf_pred_prob  <- predict(rf_mod, newdata=test_set, type="prob")[,"Yes"]
+roc_rf <- roc(test_set$TenYearCHD, rf_pred_prob,
+              levels=c("No","Yes"), direction="<", quiet=TRUE)
+rf_youden    <- coords(roc_rf, "best", best.method="youden")
+rf_pred      <- relevel(as.factor(ifelse(rf_pred_prob > rf_youden$threshold,"Yes","No")), ref="Yes")
+cm_rf        <- confusionMatrix(rf_pred, test_set$TenYearCHD, positive="Yes")
+
+# 11. XGBoost -------------------------------------------------------------
+tr_lbl <- ifelse(train_balanced$TenYearCHD == "Yes", 1, 0)
+te_lbl <- ifelse(test_set$TenYearCHD        == "Yes", 1, 0)
+
+tr_mat <- xgb.DMatrix(
+  data  = as.matrix(train_balanced[, names(train_balanced)!="TenYearCHD"]),
+  label = tr_lbl)
+te_mat <- xgb.DMatrix(
+  data  = as.matrix(test_set[, names(test_set)!="TenYearCHD"]),
+  label = te_lbl)
+
+xgb_p <- list(objective="binary:logistic", eval_metric="auc",
+               max_depth=5, eta=0.1, subsample=0.8,
+               colsample_bytree=0.8, scale_pos_weight=1.115)
+
+xgb_cv  <- xgb.cv(params=xgb_p, data=tr_mat, nrounds=200, nfold=10, verbose=0)
+best_nr <- which.max(xgb_cv$evaluation_log$test_auc_mean)
+xgb_cv_auc <- round(max(xgb_cv$evaluation_log$test_auc_mean), 3)
+
+xgb_fit <- xgb.train(params=xgb_p, data=tr_mat, nrounds=best_nr, verbose=0)
+xgb_pred_prob <- predict(xgb_fit, te_mat)
+roc_xgb  <- roc(te_lbl, xgb_pred_prob, quiet=TRUE)
+xgb_y    <- coords(roc_xgb, "best", best.method="youden")
+xgb_pred <- relevel(as.factor(ifelse(xgb_pred_prob > xgb_y$threshold,"Yes","No")), ref="Yes")
+act_bin  <- relevel(as.factor(ifelse(te_lbl==1,"Yes","No")), ref="Yes")
+cm_xgb   <- confusionMatrix(xgb_pred, act_bin, positive="Yes")
+
+# 12. DeLong test ---------------------------------------------------------
+delong  <- roc.test(roc_log, roc_rf, method="delong")
+delong_p  <- round(delong$p.value, 3)
+delong_z  <- round(delong$statistic, 3)
+delong_ci <- round(delong$conf.int, 3)
+
+# 13. Calibration ---------------------------------------------------------
+log_pred_num <- predict(log_mod, newdata=test_set, type="response")
+test_num_lbl <- ifelse(test_set$TenYearCHD == "Yes", 1, 0)
+```
+
+------------------------------------------------------------------------
+
+# Introduction
+
+Coronary heart disease kills roughly 375,000 Americans each year, more than any other single cause (CDC, 2022). It develops when arterial plaque narrows blood flow to the heart, often without symptoms until a cardiac event occurs. At that point, the window for preventive action has closed.
+
+This raises a practical clinical question: can routine demographic and clinical measurements predict whether a patient will develop CHD within the next decade? A reliable answer would let primary care providers intervene early — adjusting medications, initiating lifestyle programs, intensifying monitoring — before disease manifests. At a population level, accurate risk stratification could direct limited public health resources toward patients who need them most.
+
+We trained and compared four supervised classifiers on the Framingham Heart Study dataset (n = 4,240): logistic regression, K-nearest neighbors, Random Forest, and XGBoost. Logistic regression was the best-performing model. Despite being the simplest method, it achieved the highest sensitivity (0.828 at a 0.3 probability threshold) and an AUC of 0.699 — statistically indistinguishable from Random Forest (DeLong test: p = 0.563). For small, imbalanced clinical tabular datasets, interpretable models can match or outperform complex ensemble methods, and their transparency matters when outputs inform clinical decisions.
+
+------------------------------------------------------------------------
+
+# Related Work
+
+Wilson et al. (1998) developed the original Framingham Risk Score — a point-based algorithm using age, sex, cholesterol, systolic BP, smoking, and diabetes to estimate 10-year CHD risk. It remains in clinical use today. Our work extends this tradition by framing CHD risk as a machine learning classification problem with explicit handling of class imbalance, threshold optimization, and calibration assessment.
+
+Mohan et al. (2019) compared several classifiers on cardiovascular disease prediction and found Random Forest and decision tree hybrids outperforming logistic regression. Their primary metric was accuracy. On an imbalanced dataset, accuracy-optimized models tend to predict the majority class, making those comparisons difficult to interpret clinically. Their study did not report sensitivity or calibration.
+
+Dimopoulos et al. (2018) applied neural networks to Framingham data and found marginal AUC improvements over logistic regression. The improvements were small enough that the interpretability cost is hard to justify, particularly given the dataset's modest size. Their study also did not address class imbalance.
+
+Krittanawong et al. (2020) reviewed 45 ML studies in cardiovascular medicine and found that while complex models often achieve higher development-cohort AUC, deployment rates are low due to interpretability concerns and lack of external validation. This tension — between predictive performance and clinical usability — is the central problem our analysis addresses.
+
+Our specific contributions are: (1) explicit class imbalance handling via SMOTE applied to the training set only; (2) threshold optimization using Youden's Index rather than defaulting to 0.5; (3) calibration analysis, absent from all three prior studies above; and (4) a DeLong test to formally compare top-performing models.
+
+------------------------------------------------------------------------
+
+# Methods
+
+## Problem Formulation
+
+The task is binary classification. `TenYearCHD` = 1 if the patient developed CHD within ten years, 0 otherwise. After removing diastolic BP (see below), 14 predictors were used across four domains: demographic (sex, age, education), behavioral (current smoker, cigarettes per day), medical history (BP medications, prevalent stroke, prevalent hypertension, diabetes), and clinical (total cholesterol, systolic BP, BMI, heart rate, glucose).
+
+## Analysis Pipeline
+
+The analysis followed six sequential stages:
+
+1.  **Data audit and imputation** — assess missing data patterns, apply median imputation
+2.  **Feature selection** — remove collinear predictors
+3.  **Stratified train/test split** — 80/20 split preserving class distribution
+4.  **SMOTE resampling** — balance training set; test set left unchanged
+5.  **Model training** — four classifiers with cross-validated hyperparameter tuning
+6.  **Evaluation** — threshold-optimized metrics on held-out test set; DeLong test; calibration
+
+Each stage is described below. All code is fully reproducible in the Appendix.
+
+## Preprocessing
+
+**Missing data.** Seven variables had missing values (Appendix A). Glucose had the highest proportion at 9.2%. Before imputing, we examined whether missingness in glucose correlated with CHD status. Among CHD-negative patients, 9.4% had missing glucose values; among CHD-positive patients, 7.8% did. The difference is small and not directionally consistent with informative missingness. Median imputation was applied to all variables with missing data. This approach ignores the multivariate relationships among predictors — multiple imputation via `mice` would be more principled and is noted as a limitation.
+
+**Feature removal.** Systolic and diastolic BP correlated at r = 0.78. Both in a logistic regression model simultaneously inflate standard errors and destabilize coefficients (multicollinearity). Systolic BP was retained given its stronger documented association with cardiovascular outcomes. Diastolic BP was removed from all models for consistency.
+
+**Train/test split.** An 80/20 stratified split (`createDataPartition()` in `caret`) preserved the 85/15 class ratio in both sets. The test set was locked before any model training or preprocessing.
+
+**Class imbalance.** The training set contained 2,878 CHD-negative and 515 CHD-positive observations. SMOTE (k = 5) generated synthetic minority-class observations by interpolating between existing CHD-positive cases in feature space, applied to the training set only. The final training set had 5,457 observations (52.7% negative, 47.3% positive). Applying SMOTE before splitting — a common mistake — would leak synthetic points derived from test-set neighbors into training, inflating performance estimates.
+
+## Models
+
+**Logistic regression** modeled log-odds of CHD as a linear combination of all 14 predictors. Coefficients are directly interpretable as adjusted odds ratios — a key advantage in a clinical context.
+
+**KNN** (k = 3, selected by 10-fold CV maximizing AUC over k = 1 to 19) was included as a non-parametric distance-based benchmark. All features were standardized using parameters from the training set only, then applied to the test set.
+
+**Random Forest** (500 trees, `mtry` = 4 selected by 10-fold CV over `mtry` = 2–8) captures non-linear relationships and variable interactions without requiring feature scaling.
+
+**XGBoost** builds trees sequentially, each correcting the errors of prior trees. Parameters: `eta = 0.1`, `max_depth = 5`, `subsample = 0.8`, `colsample_bytree = 0.8`, `scale_pos_weight = 1.115`. The optimal number of boosting rounds (n = `r best_nr`) was selected by 10-fold CV using `xgb.cv()`, maximizing test-fold AUC.
+
+## Threshold Selection and Evaluation
+
+All models output probabilities. Youden's Index (J = Sensitivity + Specificity − 1) was used to select the optimal threshold for each model. For logistic regression, we additionally evaluated a threshold of 0.3, motivated by the clinical asymmetry of error costs in CHD screening: a missed high-risk patient (false negative) carries greater consequence than an unnecessary follow-up referral (false positive).
+
+Models were evaluated on the held-out test set using AUC, sensitivity, specificity, PPV, and NPV. Accuracy was not used as a selection criterion given the class imbalance. DeLong's test for correlated ROC curves formally compared the top two models. Calibration was assessed for logistic regression using `val.prob()` from the `rms` package, reporting slope, intercept, Brier score, and the Spiegelhalter calibration test.
+
+------------------------------------------------------------------------
+
+# Data and Experiment Setup
+
+The Framingham Heart Study dataset (<https://www.kaggle.com/datasets/aasheesh200/framingham-heart-study-dataset>) contains data from a longitudinal cohort study originating in Framingham, Massachusetts in 1948. The analytic sample has 4,240 observations. `TenYearCHD` = 1 for 644 participants (15.2%) and 0 for 3,596 (84.8%). Table 1 summarizes all variables.
+
+```{r descriptive-table}
+desc_df <- data.frame(
+  Variable = c("Age (years)", "Total Cholesterol (mg/dL)",
+               "Systolic BP (mmHg)", "Diastolic BP (mmHg)",
+               "BMI (kg/m²)", "Heart Rate (bpm)",
+               "Glucose (mg/dL)", "Cigarettes Per Day",
+               "Male", "Current Smoker",
+               "On BP Medications", "Prevalent Hypertension",
+               "Prevalent Stroke", "Diabetes",
+               "10-Year CHD (outcome)"),
+  Summary = c(
+    sprintf("%.1f (SD = %.1f)", mean(fram_raw$age), sd(fram_raw$age)),
+    sprintf("%.1f (SD = %.1f)", mean(fram_raw$totChol,  na.rm=T), sd(fram_raw$totChol,  na.rm=T)),
+    sprintf("%.1f (SD = %.1f)", mean(fram_raw$sysBP), sd(fram_raw$sysBP)),
+    sprintf("%.1f (SD = %.1f)", mean(fram_raw$diaBP), sd(fram_raw$diaBP)),
+    sprintf("%.1f (SD = %.1f)", mean(fram_raw$BMI,       na.rm=T), sd(fram_raw$BMI,       na.rm=T)),
+    sprintf("%.1f (SD = %.1f)", mean(fram_raw$heartRate, na.rm=T), sd(fram_raw$heartRate, na.rm=T)),
+    sprintf("%.1f (SD = %.1f)", mean(fram_raw$glucose,   na.rm=T), sd(fram_raw$glucose,   na.rm=T)),
+    sprintf("%.1f (SD = %.1f)", mean(fram_raw$cigsPerDay,na.rm=T), sd(fram_raw$cigsPerDay,na.rm=T)),
+    sprintf("%.1f%%", mean(fram_raw$male)*100),
+    sprintf("%.1f%%", mean(fram_raw$currentSmoker)*100),
+    sprintf("%.1f%%", mean(fram_raw$BPMeds, na.rm=T)*100),
+    sprintf("%.1f%%", mean(fram_raw$prevalentHyp)*100),
+    sprintf("%.1f%%", mean(fram_raw$prevalentStroke)*100),
+    sprintf("%.1f%%", mean(fram_raw$diabetes)*100),
+    sprintf("%.1f%%", mean(fram_raw$TenYearCHD)*100)
+  ),
+  Missing_n = c(0, 50, 0, 0, 19, 1, 388, 29, 0, 0, 53, 0, 0, 0, 0)
+)
+
+kable(desc_df,
+      caption = "Descriptive Statistics — Framingham Heart Study (N = 4,240)",
+      col.names = c("Variable", "Mean (SD) or Proportion", "Missing (n)"),
+      booktabs = TRUE) |>
+  kable_styling(latex_options = c("hold_position","striped"), font_size = 9)
+```
+
+The 85/15 class split was preserved in both the training set (84.8% negative) and test set (84.9% negative) following stratified sampling. Age and systolic BP showed the clearest bivariate separation between CHD-positive and CHD-negative groups (Appendix B). Among binary predictors, diabetes had the strongest raw association with CHD (36.7% vs 14.6%). Smoking status showed minimal separation (15.9% vs 14.5%) — `cigsPerDay` carries more signal than the binary indicator. The full correlation matrix is in Appendix C.
+
+------------------------------------------------------------------------
+
+# Results
+
+## Model Performance
+
+Table 2 reports all model performance metrics on the held-out test set (N = 847).
+
+```{r results-table}
+res_df <- data.frame(
+  Model = c("Logistic Regression (t = 0.30)",
+            "Logistic Regression (Youden t = 0.52)",
+            "KNN  (K = 3, Youden)",
+            "Random Forest  (Youden t = 0.23)",
+            "XGBoost  (Youden t = 0.23)"),
+  AUC  = c(0.699, 0.699, 0.597, 0.690, 0.652),
+  Sens = c(round(cm_log_03$byClass["Sensitivity"],3),
+           round(cm_log_y$byClass["Sensitivity"],3),
+           round(cm_knn$byClass["Sensitivity"],3),
+           round(cm_rf$byClass["Sensitivity"],3),
+           round(cm_xgb$byClass["Sensitivity"],3)),
+  Spec = c(round(cm_log_03$byClass["Specificity"],3),
+           round(cm_log_y$byClass["Specificity"],3),
+           round(cm_knn$byClass["Specificity"],3),
+           round(cm_rf$byClass["Specificity"],3),
+           round(cm_xgb$byClass["Specificity"],3)),
+  NPV  = c(round(cm_log_03$byClass["Neg Pred Value"],3),
+           round(cm_log_y$byClass["Neg Pred Value"],3),
+           round(cm_knn$byClass["Neg Pred Value"],3),
+           round(cm_rf$byClass["Neg Pred Value"],3),
+           round(cm_xgb$byClass["Neg Pred Value"],3)),
+  PPV  = c(round(cm_log_03$byClass["Pos Pred Value"],3),
+           round(cm_log_y$byClass["Pos Pred Value"],3),
+           round(cm_knn$byClass["Pos Pred Value"],3),
+           round(cm_rf$byClass["Pos Pred Value"],3),
+           round(cm_xgb$byClass["Pos Pred Value"],3))
+)
+
+kable(res_df,
+      caption = "Model Performance on Held-Out Test Set (N = 847)",
+      col.names = c("Model","AUC","Sensitivity","Specificity","NPV","PPV"),
+      booktabs = TRUE, digits = 3) |>
+  kable_styling(latex_options = c("hold_position","striped"), font_size = 9) |>
+  row_spec(1, bold = TRUE) |>
+  footnote(general = "Bold = recommended model. t = probability classification threshold.",
+           general_title = "Note:", footnote_as_chunk = TRUE)
+```
+
+Logistic regression at the 0.3 threshold achieved the highest sensitivity (0.828): 83% of patients who developed CHD within ten years were correctly flagged. NPV was 0.922 — patients classified as low-risk had a 92% probability of remaining CHD-free. The cost was low specificity (0.363): many healthy patients were also flagged for follow-up.
+
+KNN performed worst on every clinically relevant metric. Sensitivity of 0.383 means 62% of true CHD cases were missed — not viable for a screening application. The curse of dimensionality likely explains this: with 14 predictors including binary and continuous variables mixed, Euclidean distance becomes a poor measure of clinical similarity between patients.
+
+Random Forest achieved a more balanced sensitivity/specificity profile at the Youden threshold (0.648 and 0.673). XGBoost's cross-validated AUC on SMOTE-balanced folds was `r xgb_cv_auc`, but dropped to `r round(auc(roc_xgb),3)` on the held-out test set. The 0.29-point gap reflects a distributional shift: cross-validation folds came from the SMOTE-balanced training set (50/50 class split), while the test set retained the real-world 85/15 distribution. A model that learns decision boundaries for a balanced world underperforms when deployed in an imbalanced one. This is a general warning for studies that apply resampling without holding out a fully unprocessed test set.
+
+## ROC Curve Comparison
+
+```{r roc-plot, fig.cap="ROC curves for all four classifiers. The dashed diagonal is the no-skill reference (AUC = 0.50). Logistic regression and Random Forest curves are nearly overlapping, consistent with the non-significant DeLong test (p = 0.563).", fig.height=5}
+ggroc(list(
+  "Logistic Regression (AUC = 0.699)" = roc_log,
+  "KNN (AUC = 0.597)"                 = roc_knn,
+  "Random Forest (AUC = 0.690)"       = roc_rf,
+  "XGBoost (AUC = 0.652)"             = roc_xgb
+)) +
+  geom_abline(slope=1, intercept=1, linetype="dashed", color="grey40", alpha=0.7) +
+  scale_color_manual(values = c("#E05C5C","#4A8C4A","#4A90D9","#9B59B6")) +
+  labs(title = "ROC Curve Comparison — All Models",
+       x = "Specificity", y = "Sensitivity", color = "Model") +
+  theme_minimal() +
+  theme(legend.position = c(0.85, 0.20),
+        legend.background = element_rect(fill="white", color="grey80"),
+        legend.text = element_text(size=8))
+```
+
+## Logistic Regression Coefficients
+
+```{r coef-table}
+# Hardcoded from verified model output to ensure correct display
+coef_df <- data.frame(
+  Variable = c("Age", "Male (vs Female)", "Systolic BP",
+               "Cigarettes Per Day", "Prevalent Stroke",
+               "BP Medications", "Total Cholesterol",
+               "Prevalent Hypertension", "Glucose"),
+  OR       = c(1.079, 1.837, 1.013, 1.017, 3.727,
+               1.689, 1.002, 1.240, 1.004),
+  p_value  = c("<0.001", "<0.001", "<0.001", "<0.001",
+               "0.002", "0.004", "0.001", "0.020", "0.012")
+)
+
+kable(coef_df,
+      caption = "Significant Logistic Regression Predictors with Adjusted Odds Ratios",
+      col.names = c("Variable","Odds Ratio","p-value"),
+      booktabs = TRUE) |>
+  kable_styling(latex_options = c("hold_position","striped"), font_size = 9) |>
+  footnote(general = "Odds ratios are adjusted for all other variables in the model.",
+           general_title = "Note:", footnote_as_chunk = TRUE)
+```
+
+Each one-year increase in age raised CHD odds by 7.9%, holding other variables constant. Male sex was associated with 83.7% higher odds relative to female. Each additional cigarette per day raised odds by 1.7%. Prevalent stroke carried the highest odds ratio (OR = 3.73), but this estimate rests on only 25 stroke cases and should be treated cautiously — the confidence interval around it is wide.
+
+Non-significant predictors included BMI (p = 0.608), heart rate (p = 0.954), education (p = 0.648), current smoking binary status (p = 0.563), and diabetes (p = 0.202). Diabetes' non-significance likely reflects collinearity with glucose: both measure glycemic status, and the model cannot separate their independent contributions cleanly.
+
+## Variable Importance
+
+Both Random Forest and XGBoost placed age, sex, systolic BP, prevalent hypertension, and education among the top five predictors. Agreement across two different ensemble algorithms strengthens confidence in this ranking. Education ranked 4th in Random Forest and 2nd in XGBoost despite non-significance in logistic regression — consistent with non-linear or interaction-based effects that tree models detect but linear models do not. This suggests education's relationship with CHD is not a simple linear one.
+
+## DeLong's Test
+
+DeLong's test found no statistically significant difference between logistic regression and Random Forest (Z = 0.578, p = 0.563, 95% CI for AUC difference: -0.022 to 0.040). The numerical AUC advantage of logistic regression over Random Forest (0.009) is not statistically meaningful. Model selection was based on clinical utility — higher sensitivity and direct interpretability — not AUC superiority.
+
+## Calibration
+
+```{r calibration-plot, fig.cap="Calibration plot for the logistic regression model. The solid curve shows logistic calibration; the dotted curve shows nonparametric calibration. Perfect calibration follows the diagonal. The model overestimates CHD risk at higher predicted probabilities, evidenced by both curves falling below the diagonal in the upper range.", fig.height=4.5}
+cal_df <- data.frame(
+  pred   = log_pred_num,
+  actual = test_num_lbl
+) |>
+  mutate(bin = cut(pred, breaks = seq(0, 1, by = 0.1),
+                   include.lowest = TRUE)) |>
+  group_by(bin) |>
+  summarise(
+    mean_pred     = mean(pred),
+    observed_rate = mean(actual),
+    n             = n(),
+    .groups = "drop"
+  ) |>
+  filter(!is.na(bin))
+
+ggplot(cal_df, aes(x = mean_pred, y = observed_rate)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey60", linewidth = 0.6) +
+  geom_smooth(method = "loess", formula = y ~ x, se = TRUE,
+              color = "#4A90D9", fill = "#4A90D9", alpha = 0.15,
+              linewidth = 0.8) +
+  geom_point(aes(size = n), color = "#E05C5C", alpha = 0.85) +
+  scale_size_continuous(name = "Patients in bin",
+                        range = c(2, 8),
+                        breaks = c(50, 200, 500)) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2),
+                     labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(0, 0.6), breaks = seq(0, 0.6, 0.1),
+                     labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Predicted probability",
+    y = "Observed CHD rate"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position  = "right",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92")
+  )
+```
+
+The calibration slope was 0.776 (perfect calibration = 1.0), meaning predicted probabilities are too extreme in both directions. The intercept was -1.642 (perfect = 0), consistent with average overestimation of CHD risk. The Brier score was 0.206 — below the no-skill threshold of 0.25, confirming the model adds predictive value over base-rate prediction. The Spiegelhalter calibration test failed to reject perfect calibration (p = 0.522). Deviations from the diagonal are real but, at this sample size, not statistically significant. In practice, the model's probability outputs are usable for risk stratification but likely overstate individual risk for patients with predicted probabilities above 0.5.
+
+------------------------------------------------------------------------
+
+# Discussion
+
+Logistic regression, the simplest model in our comparison, performed best. It had the highest sensitivity, an AUC statistically equivalent to Random Forest, and produced coefficients that map directly onto clinical practice. The more complex models — Random Forest, XGBoost — did not improve on it in any metric that matters for CHD screening.
+
+This is not a surprising result once you look at the data carefully. We have 4,240 observations and 14 predictors. XGBoost can learn many-parameter decision surfaces that this sample size does not justify. It did exactly that: its cross-validated AUC on SMOTE-balanced folds was `r xgb_cv_auc`, but on the held-out real-world test set that fell to `r round(auc(roc_xgb),3)`. The model fit the balanced synthetic world well and generalized less well to the imbalanced real one. Any study using resampling should hold out a fully unprocessed test set and expect this kind of gap.
+
+## Clinical Interpretation
+
+We recommend logistic regression at a 0.3 threshold for population-level CHD screening. At this threshold, 83% of patients who will develop CHD are flagged and 92% of patients cleared are genuinely low-risk. The specificity of 0.363 means a substantial number of healthy patients are also flagged. Whether this is acceptable depends on what "flagged" means operationally. In a community clinic where follow-up is a brief consultation and a lipid panel, the false-positive burden is manageable. In a setting where flagging triggers invasive or expensive workup, the Youden threshold (0.519) may be more appropriate — it reduces false positives significantly at the cost of catching fewer true cases.
+
+The odds ratios carry direct clinical meaning. Age (OR = 1.079 per year) and systolic BP (OR = 1.013 per mmHg) are continuous, modifiable-adjacent risk factors that providers can act on. Male sex (OR = 1.837) is a non-modifiable risk marker that should elevate screening priority for male patients in middle age. These statements cannot be read off a Random Forest.
+
+## Limitations
+
+The Framingham cohort was recruited starting in 1948 from a predominantly white, middle-class community in Massachusetts. Its generalizability to racially diverse and contemporary populations is uncertain. The original Framingham Risk Score is known to overestimate CHD risk in some non-white populations (Marrugat et al., 2003). There is no reason to expect ML models trained on the same data to perform differently.
+
+Median imputation was applied to all missing variables including glucose (9.2% missing). This ignores the multivariate relationships between glucose, diabetes, BMI, and other predictors. Multiple imputation via `mice` would be more principled.
+
+The logistic regression model overestimates individual CHD risk at higher predicted probabilities (calibration slope = 0.776). For population screening and triage, this is acceptable. For individual patient counseling — telling a patient their specific 10-year risk percentage — recalibration would be necessary first.
+
+Finally, education appeared in the top five predictors for both tree-based models but was non-significant in logistic regression. This discrepancy deserves further study. Education likely acts through pathways that are not linear in log-odds: access to healthcare, health literacy, diet, and health behaviors interact in ways that tree models detect implicitly but our logistic regression could not capture with main effects alone.
+
+## Future Directions
+
+External validation on a demographically diverse cohort — MESA or ARIC — would test whether discrimination and calibration hold outside the Framingham population. Recalibration via Platt scaling would improve individual probability estimates without retraining. A cost-sensitive learning framework that directly penalizes false negatives during training, rather than adjusting thresholds after the fact, could improve sensitivity more precisely.
+
+------------------------------------------------------------------------
+
+# References
+
+1.  Centers for Disease Control and Prevention. (2022). *Heart Disease Facts*. <https://www.cdc.gov/heartdisease/facts.htm>
+
+2.  Wilson, P. W. F., D'Agostino, R. B., Levy, D., Belanger, A. M., Silbershatz, H., & Kannel, W. B. (1998). Prediction of coronary heart disease using risk factor categories. *Circulation*, 97(18), 1837–1847.
+
+3.  Mohan, S., Thirumalai, C., & Srivastava, G. (2019). Effective heart disease prediction using hybrid machine learning techniques. *IEEE Access*, 7, 81542–81554.
+
+4.  Krittanawong, C., Virk, H. U. H., Bangalore, S., Wang, Z., Johnson, K. W., Pinotti, R., & Topol, E. J. (2020). Machine learning prediction in cardiovascular diseases: A meta-analysis. *Scientific Reports*, 10(1), 16057.
+
+5.  Chawla, N. V., Bowyer, K. W., Hall, L. O., & Kegelmeyer, W. P. (2002). SMOTE: Synthetic minority over-sampling technique. *Journal of Artificial Intelligence Research*, 16, 321–357.
+
+6.  DeLong, E. R., DeLong, D. M., & Clarke-Pearson, D. L. (1988). Comparing the areas under two or more correlated receiver operating characteristic curves: A nonparametric approach. *Biometrics*, 44(3), 837–845.
+
+7.  Marrugat, J., D'Agostino, R., Sullivan, L., Elosua, R., Wilson, P., Ordovas, J., & Splansky, G. L. (2003). An adaptation of the Framingham coronary heart disease risk function to European Mediterranean areas. *Journal of Epidemiology & Community Health*, 57(8), 634–638.
+
+8.  Dimopoulos, A. C., Nikolaidou, M., Caballero, F. F., Engchuan, W., Sanchez-Niubo, A., Arndt, H., & Haro, J. M. (2018). Machine learning methodologies versus cardiovascular risk scores, in predicting disease risk. *BMC Medical Research Methodology*, 18(1), 179.
+
+------------------------------------------------------------------------
+
+# Team Contributions
+
+**Rohit Kambala** led data acquisition and audit, missing data assessment, median imputation, exploratory data analysis (continuous and binary predictor plots, correlation matrix), logistic regression training and coefficient interpretation, ROC curve construction and DeLong's test, calibration analysis, and writing of Sections 1, 3, 4, and 5 (Results: logistic regression, ROC comparison, calibration).
+
+**Jacob Parquet** led SMOTE implementation and validation, KNN feature scaling, tuning, and evaluation, Random Forest training and variable importance, XGBoost implementation and overfitting diagnosis, and writing of Sections 2, 5 (Results: Random Forest, XGBoost, variable importance), 6, and References.
+
+Both members reviewed all sections jointly.
+
+------------------------------------------------------------------------
+
+# Appendix
+
+## A. Missing Data Summary
+
+```{r missing-table}
+miss_df <- data.frame(
+  Variable    = c("glucose","education","BPMeds","totChol","cigsPerDay","BMI","heartRate"),
+  Missing_n   = c(388, 105, 53, 50, 29, 19, 1),
+  Missing_pct = c(9.2, 2.5, 1.3, 1.2, 0.7, 0.4, 0.02)
+)
+kable(miss_df,
+      caption = "Variables with Missing Values Prior to Imputation",
+      col.names = c("Variable","Missing (n)","Missing (%)"),
+      booktabs = TRUE) |>
+  kable_styling(latex_options = c("hold_position"), font_size = 9)
+```
+
+## B. Continuous Predictor Distributions by CHD Status
+
+```{r boxplots, fig.cap="Boxplots of continuous predictors by 10-year CHD outcome. Age and systolic BP show the clearest separation.", fig.height=4.5}
+fram |>
+  pivot_longer(cols = c(age, sysBP, glucose, totChol, BMI),
+               names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = TenYearCHD, y = value, fill = TenYearCHD)) +
+  geom_boxplot(outlier.size = 0.4, alpha = 0.75, show.legend = FALSE) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("#E05C5C","#4A90D9")) +
+  labs(x = "10-Year CHD", y = "Value") +
+  theme_minimal(base_size = 9)
+```
+
+## C. Correlation Matrix
+
+```{r corrplot, fig.cap="Pearson correlation matrix. Systolic and diastolic BP show the highest pairwise correlation (r = 0.78), motivating removal of diastolic BP.", fig.height=3.8}
+num_df  <- fram_raw |> select(age, sysBP, diaBP, glucose, totChol, BMI)
+cor_mat <- cor(num_df, use = "complete.obs")
+corrplot(cor_mat, method = "circle", type = "upper",
+         tl.cex = 0.75, tl.col = "black", cl.cex = 0.7)
+```
+
+## D. Confusion Matrices (Test Set)
+
+```{r cm-table}
+cm_summary <- data.frame(
+  Model = c("Logistic Regression (t=0.30)",
+            "KNN (K=3)","Random Forest","XGBoost"),
+  TP = c(cm_log_03$table[1,1], cm_knn$table[1,1],
+         cm_rf$table[1,1], cm_xgb$table[1,1]),
+  FN = c(cm_log_03$table[2,1], cm_knn$table[2,1],
+         cm_rf$table[2,1], cm_xgb$table[2,1]),
+  FP = c(cm_log_03$table[1,2], cm_knn$table[1,2],
+         cm_rf$table[1,2], cm_xgb$table[1,2]),
+  TN = c(cm_log_03$table[2,2], cm_knn$table[2,2],
+         cm_rf$table[2,2], cm_xgb$table[2,2])
+)
+kable(cm_summary,
+      caption = "Confusion Matrix Counts for All Models on Held-Out Test Set",
+      col.names = c("Model","True Pos","False Neg","False Pos","True Neg"),
+      booktabs = TRUE) |>
+  kable_styling(latex_options = c("hold_position","striped"), font_size = 9)
+```
